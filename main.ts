@@ -1,31 +1,19 @@
-// Sokoban solver: push-optimal A* per room, rooms found by cutting the hallway's dead
-// squares. A level is a hallway with one to four small rooms off it; a box that leaves its
-// room can never come back, so each room is an independent problem and the level's
-// push-optimal count is the sum of its rooms'. The search is over pushes (not steps):
-// a state is the boxes' squares plus the player's reachable region, the cost is pushes,
-// and the estimate is the cheapest way to match every box to a distinct goal by the
-// shortest walks on the empty floor. Dead squares (a box there reaches no goal) and
-// frozen 2x2 blocks are pruned. Everything is deterministic: the
-// search is budgeted by states expanded, never by the wall clock, and ties break by
-// insertion order, so two runs write the same bytes.
+// Sokoban solver: push-optimal A* per room. A level is a hallway with small rooms
+// off it; a box that leaves its room never comes back, so each room is independent
+// and the level optimum is the sum of its rooms'. Deterministic: budgeted by states
+// expanded, never by the wall clock.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-// The four steps: [dx, dy, letter]. The push letter is the upper-case step letter.
 const DIRS: [number, number, string][] = [
   [0, -1, 'u'],
   [0, 1, 'd'],
   [-1, 0, 'l'],
   [1, 0, 'r'],
 ];
-
-// Work budgets (states expanded), never the clock: the run must be deterministic.
 const ROOM_BUDGET = 400_000;
 const GREEDY_BUDGET = 200_000;
-
 interface Level {
   w: number;
   h: number;
@@ -34,7 +22,6 @@ interface Level {
   boxes: number[];
   player: number;
 }
-
 function parseLevel(text: string): Level {
   const rows = text.split('\n').filter((r) => r.length > 0);
   const h = rows.length;
@@ -61,9 +48,6 @@ function parseLevel(text: string): Level {
   }
   return { w, h, wall, goals, boxes: boxes.sort((a, b) => a - b), player };
 }
-
-// Squares a box can be pushed from onto some goal: pull back from the goals over
-// open floor (a box on a square outside this set is lost, so it is never generated).
 function liveSquares(L: Level): Uint8Array {
   const { w, wall, goals } = L;
   const live = new Uint8Array(wall.length);
@@ -82,8 +66,6 @@ function liveSquares(L: Level): Uint8Array {
   }
   return live;
 }
-
-// Walking distances from every goal over the floor alone (boxes ignored).
 function goalDistances(L: Level): Int32Array[] {
   const { w, wall, goals } = L;
   const out: Int32Array[] = [];
@@ -105,10 +87,6 @@ function goalDistances(L: Level): Int32Array[] {
   }
   return out;
 }
-
-// Cheapest matching of boxes to distinct goals, by the empty-floor distances.
-// Small sets are matched exactly by trying every order; larger ones take each box's
-// nearest goal (still a lower bound on the pushes left, so the search stays optimal).
 function estimate(boxes: number[], dist: Int32Array[]): number {
   const n = boxes.length;
   if (n === 0) return 0;
@@ -147,9 +125,6 @@ function estimate(boxes: number[], dist: Int32Array[]): number {
   }
   return s;
 }
-
-// Whether the box just pushed to `t` sits in a frozen 2x2 block of walls and boxes
-// with a box off its goal inside it.
 function frozenBlock(w: number, wall: Uint8Array, occupied: Uint8Array, goal: Uint8Array, t: number): boolean {
   for (const a of [t, t - 1, t - w, t - w - 1]) {
     const b = a + 1;
@@ -160,8 +135,6 @@ function frozenBlock(w: number, wall: Uint8Array, occupied: Uint8Array, goal: Ui
   }
   return false;
 }
-
-// The shortest walk from `from` to `to` around walls and boxes, lower-case letters.
 function walkTo(w: number, wall: Uint8Array, occupied: Uint8Array, from: number, to: number): string {
   if (from === to) return '';
   const prev = new Int32Array(wall.length).fill(-1);
@@ -184,11 +157,6 @@ function walkTo(w: number, wall: Uint8Array, occupied: Uint8Array, from: number,
   for (let p = to; p !== from; p = prev[p]) s = how[p]! + s;
   return s;
 }
-
-// Push-optimal A* (greedy when `greedy` is set: rank by the estimate alone) over a
-// level. A state is its boxes plus the lowest square of the player's reachable
-// region, so the same boxes with the player in another region stay distinct. Returns
-// the pushes and the full move string, or null when the budget runs out.
 function searchPushes(
   L: Level,
   maxExpansions: number,
@@ -202,15 +170,7 @@ function searchPushes(
   if (L.boxes.some((b) => !live[b])) return null;
   const dist = goalDistances(L);
   const solved = (bs: number[]): boolean => bs.every((b) => goal[b]);
-
   const occupied = new Uint8Array(size);
-
-  // A flood-fill context: `low(from)` returns the lowest square of the region the
-  // player reaches from `from` (boxes in `occupied` block it), and `has(sq)` tests
-  // whether a square is in that region. Two contexts are kept apart: one marks the
-  // region of the state being expanded (so pushes can test the square behind the
-  // box), the other marks the region of each state a push makes (for its key).
-  // Sharing one stamp would let generating a successor erase the first's marks.
   const makeRegion = () => {
     const seen = new Int32Array(size);
     const stack = new Int32Array(size);
@@ -248,23 +208,17 @@ function searchPushes(
   };
   const reachNow = makeRegion();
   const reachNext = makeRegion();
-
-  // State key: region low, then the boxes, as digits in base `size`.
   const keyOf = (bs: number[], low: number): number => {
     let k = low;
     for (const b of bs) k = k * size + b;
     return k;
   };
-
   const sBoxes: number[][] = [L.boxes.slice()];
   const sPlayer: number[] = [L.player];
   const sParent: number[] = [-1];
   const sFrom: number[] = [-1];
   const sTo: number[] = [-1];
   const sG: number[] = [0];
-
-  // Binary heap on [rank, -g, sequence, state]: lowest rank first, then the deepest
-  // (most pushes made), then the earliest inserted. Deterministic throughout.
   const heap: [number, number, number, number][] = [];
   const less = (a: [number, number, number, number], b: [number, number, number, number]): boolean =>
     a[0] < b[0] || (a[0] === b[0] && (a[1] < b[1] || (a[1] === b[1] && a[2] < b[2])));
@@ -294,7 +248,6 @@ function searchPushes(
     }
     return top;
   };
-
   const best = new Map<number, number>();
   const closed = new Set<number>();
   let seq = 0;
@@ -307,7 +260,6 @@ function searchPushes(
   best.set(k0, 0);
   heapPush([rankOf(0, h0), 0, seq++, 0]);
   if (solved(L.boxes)) return { pushes: 0, moves: '' };
-
   let expanded = 0;
   let found = -1;
   while (heap.length > 0 && expanded < maxExpansions) {
@@ -367,8 +319,6 @@ function searchPushes(
   if (found < 0) {
     return null;
   }
-
-  // Rebuild the push sequence, then expand each push into its walk plus the push.
   const path: number[] = [];
   for (let s = found; s > 0; s = sParent[s]!) path.push(s);
   path.reverse();
@@ -389,17 +339,11 @@ function searchPushes(
   }
   return { pushes: path.length, moves };
 }
-
-// A level's rooms: cut the dead floor squares of the player's row (the hallway: a
-// box there reaches no goal) out of the floor, and each part left that holds a box is
-// a room. Null when a part holds more or fewer boxes than goals, or a box starts in
-// the hallway: then the level is no set of rooms.
 interface Room {
   boxes: number[];
   goals: number[];
   done: boolean;
 }
-
 function roomsOf(L: Level): Room[] | null {
   const { w, wall, goals, boxes, player } = L;
   const live = liveSquares(L);
@@ -430,11 +374,6 @@ function roomsOf(L: Level): Room[] | null {
   if (rooms.some((r) => r.boxes.length !== r.goals.length)) return null;
   return rooms.filter((r) => r.boxes.length > 0);
 }
-
-// The level solved room by room: each room's push-optimal solution in turn, the
-// other rooms' boxes standing as walls (on their goals once their room is done), the
-// player walking on from where the last room left it. A box never leaves its room, so
-// the rooms' optima add up to the level's. Null when a room gives up.
 function solveByRooms(L: Level): { pushes: number; moves: string } | null {
   const rooms = roomsOf(L);
   if (rooms === null) return null;
@@ -467,8 +406,6 @@ function solveByRooms(L: Level): { pushes: number; moves: string } | null {
   }
   return { pushes, moves };
 }
-
-// One level's moves: room by room, then the whole level, then nothing.
 function solveLevel(text: string): string {
   const L = parseLevel(text);
   if (L.boxes.every((b) => L.goals.includes(b))) return '';
@@ -477,7 +414,6 @@ function solveLevel(text: string): string {
   const whole = searchPushes(L, ROOM_BUDGET, false) ?? searchPushes(L, GREEDY_BUDGET, true);
   return whole === null ? '' : whole.moves;
 }
-
 for (const id of readdirSync(I).sort()) {
   const moves = solveLevel(readFileSync(join(I, id, 'level.txt'), 'utf8'));
   mkdirSync(join(O, id), { recursive: true });
